@@ -1,0 +1,23 @@
+ext {
+    extName = 'Rule34World'
+    extClass = '.Rule34World'
+    extVersionCode = 1
+    isNsfw = true
+}
+
+apply plugin: "kei.plugins.extension.legacy"
+
+android {
+    sourceSets {
+        test {
+            java.srcDirs = ['test/java']
+            kotlin.srcDirs = ['test/kotlin']
+        }
+    }
+}
+
+dependencies {
+    testImplementation "org.jetbrains.kotlin:kotlin-stdlib:2.3.21"
+    testImplementation libs.bundles.common
+    testImplementation libs.junit
+}
