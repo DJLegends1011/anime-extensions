@@ -1,5 +1,7 @@
 package eu.kanade.tachiyomi.animeextension.en.rule34world
 
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+
 internal object Rule34WorldUtils {
     private const val SITE_BASE_URL = "https://rule34.world"
     private const val STORAGE_BASE_URL = "https://rule34storage.b-cdn.net"
@@ -36,6 +38,16 @@ internal object Rule34WorldUtils {
         }
     }
 
+    fun postIdFromUrl(query: String): Long? {
+        val url = query.trim().toHttpUrlOrNull() ?: return null
+        if (url.scheme != "https" || url.host != "rule34.world") return null
+
+        val segments = url.pathSegments.filter(String::isNotBlank)
+        if (segments.size != 2 || segments.first() != "post") return null
+
+        return segments.last().toLongOrNull()
+    }
+
     fun mediaUrl(
         postId: Long,
         fileId: String,
@@ -65,22 +77,7 @@ internal object Rule34WorldUtils {
         .firstOrNull { post.files.containsKey(it) || post.filesDirect[it]?.isNotBlank() == true }
         ?.let { mediaUrl(post.id, it, post.files, post.filesDirect) }
 
-    fun title(post: Rule34WorldPost): String {
-        val tags = post.tags.mapNotNull { it.value.takeIf(String::isNotBlank) }
-        if (tags.isNotEmpty()) return tags.take(5).joinToString(" ")
-
-        return buildString {
-            append("Post #")
-            append(post.id)
-            post.duration?.let { append(" (${it}s)") }
-            if (post.width != null && post.height != null) {
-                append(" - ")
-                append(post.width)
-                append("x")
-                append(post.height)
-            }
-        }
-    }
+    fun title(post: Rule34WorldPost): String = "Post #${post.id}"
 
     fun formatGroupedTagsForDescription(tags: List<Rule34WorldTag>): String = groupedTags(tags)
         .joinToString("\n") { group ->
@@ -118,9 +115,11 @@ internal object Rule34WorldUtils {
         blockedTags: List<String>,
         perGroupLimit: Int,
         totalLimit: Int,
+        priorityTags: List<String> = emptyList(),
     ): List<Rule34WorldPost> {
         val cappedTotalLimit = totalLimit.coerceAtLeast(0)
         val cappedPerGroupLimit = perGroupLimit.coerceAtLeast(0)
+        val normalizedPriorityTags = priorityTags.mapNotNull(::normalizedTag).toSet()
         val suggestions = linkedMapOf<Long, Rule34WorldPost>()
 
         postGroups.forEach { posts ->
@@ -128,10 +127,21 @@ internal object Rule34WorldUtils {
             if (cappedPerGroupLimit == 0) return@forEach
 
             var addedFromGroup = 0
-            for (post in filterBlockedPosts(posts, blockedTags)) {
+            val rankedPosts = filterBlockedPosts(posts, blockedTags)
+                .asSequence()
+                .filter { it.id != currentPostId }
+                .filter { it.type == Rule34WorldRequests.TYPE_VIDEO && it.status == Rule34WorldRequests.STATUS_POSTED }
+                .withIndex()
+                .distinctBy { it.value.id }
+                .sortedWith(
+                    compareByDescending<IndexedValue<Rule34WorldPost>> {
+                        sharedPriorityTagScore(it.value, normalizedPriorityTags)
+                    }.thenBy { it.index },
+                )
+                .map { it.value }
+
+            for (post in rankedPosts) {
                 if (addedFromGroup >= cappedPerGroupLimit || suggestions.size >= cappedTotalLimit) break
-                if (post.id == currentPostId) continue
-                if (post.type != Rule34WorldRequests.TYPE_VIDEO || post.status != Rule34WorldRequests.STATUS_POSTED) continue
                 if (suggestions.containsKey(post.id)) continue
 
                 suggestions[post.id] = post
@@ -140,6 +150,19 @@ internal object Rule34WorldUtils {
         }
 
         return suggestions.values.toList()
+    }
+
+    fun suggestionSearchBatches(tags: List<String>): List<List<String>> {
+        val cleanedTags = tags
+            .map(String::trim)
+            .filter(String::isNotBlank)
+            .distinctBy { normalizedTag(it) }
+
+        return when (cleanedTags.size) {
+            0 -> emptyList()
+            1 -> listOf(cleanedTags)
+            else -> listOf(cleanedTags) + cleanedTags.map(::listOf)
+        }
     }
 
     fun suggestionSearchTagGroups(tags: List<Rule34WorldTag>): List<Rule34WorldSuggestionTagGroup> {
@@ -199,6 +222,16 @@ internal object Rule34WorldUtils {
     private fun normalizedTag(value: String): String? = value.trim()
         .lowercase()
         .takeIf(String::isNotBlank)
+
+    private fun sharedPriorityTagScore(post: Rule34WorldPost, priorityTags: Set<String>): Int {
+        if (priorityTags.isEmpty()) return 0
+
+        return post.tags
+            .asSequence()
+            .mapNotNull { normalizedTag(it.value) }
+            .distinct()
+            .count { it in priorityTags }
+    }
 
     private const val TAG_TYPE_GENERAL = 1
     private const val TAG_TYPE_COPYRIGHT = 2

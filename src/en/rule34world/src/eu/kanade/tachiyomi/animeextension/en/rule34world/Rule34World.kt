@@ -14,7 +14,6 @@ import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import kotlinx.serialization.json.Json
 import okhttp3.Headers
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
 
@@ -68,7 +67,7 @@ class Rule34World :
     // =============================== Search ===============================
 
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
-        postIdFromUrl(query)?.let { id ->
+        Rule34WorldUtils.postIdFromUrl(query)?.let { id ->
             val post = client.newCall(GET("$apiUrl/post/$id", headers))
                 .execute()
                 .parseAs<Rule34WorldPost>(json)
@@ -109,13 +108,14 @@ class Rule34World :
         val tagGroups = Rule34WorldUtils.suggestionSearchTagGroups(currentPost.tags)
             .map { group -> group.tags.take(SUGGESTION_TAGS_PER_GROUP_LIMIT) }
             .filter(List<String>::isNotEmpty)
+        val priorityTags = tagGroups.flatten()
         val perGroupLimit = suggestionLimitPerGroup(tagGroups.size)
 
         for (tags in tagGroups) {
             val groupPosts = linkedMapOf<Long, Rule34WorldPost>()
 
-            for (tag in tags) {
-                client.newCall(searchRequest(1, Rule34WorldRequests.SORT_LATEST, listOf(tag)))
+            for (queryTags in Rule34WorldUtils.suggestionSearchBatches(tags)) {
+                client.newCall(searchRequest(1, Rule34WorldRequests.SORT_LATEST, queryTags))
                     .execute()
                     .use { searchResponse ->
                         val parsed = searchResponse.parseAs<Rule34WorldSearchResponse>(json)
@@ -132,6 +132,7 @@ class Rule34World :
             blockedTags = blockedTags,
             perGroupLimit = perGroupLimit,
             totalLimit = SUGGESTION_LIMIT,
+            priorityTags = priorityTags,
         ).map { it.toSAnime() }
     }
 
@@ -218,14 +219,6 @@ class Rule34World :
                 sources.forEach { appendLine(it) }
             }
     }.trim()
-
-    private fun postIdFromUrl(query: String): Long? {
-        val url = query.toHttpUrlOrNull() ?: return null
-        if (url.host != "rule34.world") return null
-        return url.pathSegments
-            .lastOrNull()
-            ?.toLongOrNull()
-    }
 
     private fun blacklistTags(): List<String> = Rule34WorldUtils.parseSearchTags(
         preferences.getString(PREF_BLACKLIST_TAGS, "").orEmpty(),

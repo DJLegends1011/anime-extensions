@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.animeextension.en.rule34world
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 class Rule34WorldUtilsTest {
@@ -18,6 +19,34 @@ class Rule34WorldUtilsTest {
         assertEquals(
             listOf("artist name"),
             Rule34WorldUtils.parseSearchTags("artist name"),
+        )
+    }
+
+    @Test
+    fun `postIdFromUrl accepts only rule34world post urls`() {
+        assertEquals(1338481L, Rule34WorldUtils.postIdFromUrl("https://rule34.world/post/1338481"))
+        assertEquals(1338481L, Rule34WorldUtils.postIdFromUrl("https://rule34.world/post/1338481/"))
+        assertNull(Rule34WorldUtils.postIdFromUrl("https://rule34.world/user/1338481"))
+        assertNull(Rule34WorldUtils.postIdFromUrl("https://example.com/post/1338481"))
+        assertNull(Rule34WorldUtils.postIdFromUrl("storm (marvel rivals)"))
+    }
+
+    @Test
+    fun `title uses stable post id instead of tags`() {
+        assertEquals(
+            "Post #1339948",
+            Rule34WorldUtils.title(
+                Rule34WorldPost(
+                    id = 1339948,
+                    duration = 27,
+                    width = 1920,
+                    height = 1080,
+                    tags = listOf(
+                        Rule34WorldTag(value = "storm (marvel rivals)", type = 4),
+                        Rule34WorldTag(value = "marvel rivals", type = 2),
+                    ),
+                ),
+            ),
         )
     }
 
@@ -236,6 +265,29 @@ class Rule34WorldUtilsTest {
     }
 
     @Test
+    fun `mergeSuggestionPosts ranks stronger prioritized tag matches before weak fallbacks`() {
+        val characterBatch = listOf(
+            suggestionPost(2, "storm (marvel rivals)"),
+            suggestionPost(3, "storm (marvel rivals)", "marvel rivals"),
+        )
+        val artistBatch = listOf(
+            suggestionPost(4, "vicki foxxynsfw"),
+        )
+
+        assertEquals(
+            listOf(3L, 2L, 4L),
+            Rule34WorldUtils.mergeSuggestionPosts(
+                postGroups = listOf(characterBatch, artistBatch),
+                currentPostId = 1,
+                blockedTags = emptyList(),
+                perGroupLimit = 2,
+                totalLimit = 3,
+                priorityTags = listOf("storm (marvel rivals)", "marvel rivals", "vicki foxxynsfw"),
+            ).map { it.id },
+        )
+    }
+
+    @Test
     fun `suggestionSearchTagGroups prioritizes character artist copyright and skips general tags`() {
         val tags = listOf(
             Rule34WorldTag(value = "video", count = 179287, type = 1),
@@ -273,10 +325,31 @@ class Rule34WorldUtilsTest {
         )
     }
 
-    private fun suggestionPost(id: Long): Rule34WorldPost = Rule34WorldPost(
+    @Test
+    fun `suggestionSearchBatches searches combined group before individual fallbacks`() {
+        assertEquals(
+            listOf(
+                listOf("storm (marvel rivals)", "storm (x-men)", "ororo munroe"),
+                listOf("storm (marvel rivals)"),
+                listOf("storm (x-men)"),
+                listOf("ororo munroe"),
+            ),
+            Rule34WorldUtils.suggestionSearchBatches(
+                listOf("storm (marvel rivals)", "storm (x-men)", "ororo munroe"),
+            ),
+        )
+
+        assertEquals(
+            listOf(listOf("fpsblyck")),
+            Rule34WorldUtils.suggestionSearchBatches(listOf("fpsblyck")),
+        )
+    }
+
+    private fun suggestionPost(id: Long, vararg tags: String): Rule34WorldPost = Rule34WorldPost(
         id = id,
         type = 1,
         status = 2,
-        tags = listOf(Rule34WorldTag(value = "keep")),
+        tags = (tags.takeIf { it.isNotEmpty() } ?: arrayOf("keep"))
+            .map { Rule34WorldTag(value = it) },
     )
 }
