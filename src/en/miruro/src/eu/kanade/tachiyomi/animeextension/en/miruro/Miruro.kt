@@ -96,7 +96,7 @@ class Miruro :
             .build()
 
     private val extractor by lazy {
-        MiruroExtractor(client, PIPE_KEY, PROXY_KEY, headers, preferences, baseUrl) { providerDisplayName(it) }
+        MiruroExtractor(client, PIPE_KEY, headers, preferences, { baseUrl }) { providerDisplayName(it) }
     }
 
     // ── Cookie-farming: cold-start + per-episode watch-page warm-up ──────
@@ -719,7 +719,6 @@ class Miruro :
         private const val PREF_CACHED_CONFIG_KEY = "cached_config_json"
 
         private val PIPE_KEY = "71951034f8fbcf53d89db52ceb3dc22c".decodeHex()
-        private val PROXY_KEY = "a54d389c18527d9fd3e7f0643e27edbe".decodeHex()
 
         internal const val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
 
@@ -1685,6 +1684,11 @@ class Miruro :
 
     private fun getMeta(anilistId: Int): AnimeMeta? = animeMetaCache[anilistId]
 
+    override suspend fun getVideoList(episode: SEpisode): List<Video> = client.newCall(videoListRequest(episode))
+        // The default success-only request flow throws on 444/503 before provider fallbacks can run.
+        .await()
+        .use { response -> videoListParse(response).sort() }
+
     override fun videoListRequest(episode: SEpisode): Request {
         val episodeData = JSONObject(episode.url)
         val query = buildPipeQuery(
@@ -1708,13 +1712,19 @@ class Miruro :
         val videos = mutableListOf<Video>()
 
         val primaryEpisodeId = episodeData?.optString("episodeId", "") ?: ""
-        val primaryVideos = extractor.parseStreamsFromResponse(
-            response,
-            defaultSubType,
-            provider,
-            primaryEpisodeId,
-            anilistId,
-        )
+        val primaryVideos = if (response.isSuccessful) {
+            extractor.parseStreamsFromResponse(
+                response,
+                defaultSubType,
+                provider,
+                primaryEpisodeId,
+                anilistId,
+            )
+        } else {
+            Log.w(TAG, "videoListParse: provider '$provider' returned HTTP ${response.code}, trying alternatives")
+            response.close()
+            emptyList()
+        }
         logD { "videoListParse: ${primaryVideos.size} primary streams (subType=$defaultSubType, provider=$provider)" }
         videos.addAll(primaryVideos)
 
@@ -1782,6 +1792,9 @@ class Miruro :
         }
 
         logD { "videoListParse: returning ${videos.size} total videos" }
+        if (videos.isEmpty() && !response.isSuccessful) {
+            throw IOException("No working streams found (HTTP ${response.code}). Try another provider or try again later.")
+        }
         return videos
     }
 

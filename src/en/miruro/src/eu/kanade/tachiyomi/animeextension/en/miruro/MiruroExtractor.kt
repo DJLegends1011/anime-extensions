@@ -9,21 +9,22 @@ import aniyomi.lib.omniembedextractor.OmniEmbedExtractor
 import aniyomi.lib.rapidcloudextractor.RapidCloudExtractor
 import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
+import eu.kanade.tachiyomi.network.GET
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Response
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPInputStream
 
 class MiruroExtractor(
     private val client: OkHttpClient,
     private val pipeKey: ByteArray,
-    private val proxyKey: ByteArray,
     private val headers: Headers,
     private val preferences: android.content.SharedPreferences,
-    private val mirrorBaseUrl: String,
+    private val mirrorBaseUrl: () -> String,
     private val resolveDisplayName: (String) -> String,
 ) {
 
@@ -62,19 +63,9 @@ class MiruroExtractor(
         internal const val KWIK_DEFAULT_REFERER = "https://kwik.cx/"
 
         /**
-         * Miruro frontend proxy servers (from `VITE_PROXY_A` / `VITE_PROXY_B`
-         * in `env2.js`). The frontend wraps every provider stream URL through
-         * one of these proxies: the proxy fetches the upstream m3u8/segment
-         * and relays it back, bypassing CORS and header-gating that would
-         * 403 a direct fetch from outside the browser.
-         */
-        private const val PROXY_A = "https://vault01.ultracloud.cc/"
-        private const val PROXY_B = "https://vault02.ultracloud.cc/"
-
-        /**
          * FNV-1a 32-bit hash constants (IETF RFC 7020).
          * Used by the frontend to deterministically select between
-         * [PROXY_A] and [PROXY_B] based on episode/anilist IDs.
+         * the configured proxy servers based on episode/anilist IDs.
          */
         private const val FNV_OFFSET_BASIS: Int = 2166136261.toInt()
         private const val FNV_PRIME: Int = 16777619
@@ -102,10 +93,10 @@ class MiruroExtractor(
 
         /**
          * FNV-1a 32-bit hash of a string, returning the hash mod 2 to
-         * deterministically select between [PROXY_A] (even) and [PROXY_B]
+         * deterministically select between the first (even) and second
          * (odd). Mirrors the frontend's `Xb()` function.
          *
-         * If [seed] is blank, defaults to 0 (→ PROXY_A).
+         * If [seed] is blank, defaults to the first proxy.
          */
         private fun fnv1aMod2(seed: String): Int {
             if (seed.isEmpty()) return 0
@@ -119,7 +110,7 @@ class MiruroExtractor(
 
         /**
          * Build a Miruro proxy URL wrapping [streamUrl] and [referer]
-         * through `vault01/02.ultracloud.cc`. The proxy fetches the upstream
+         * through the current frontend proxies. The proxy fetches the upstream
          * content and relays it, bypassing CORS/403s from direct fetches.
          *
          * URL format (from frontend `cx()` / `lx()`):
@@ -133,13 +124,37 @@ class MiruroExtractor(
             referer: String,
             proxyKey: ByteArray,
             proxySeed: String,
+            proxyUrls: List<String>,
         ): String {
             if (proxyKey.isEmpty()) return streamUrl
-            val proxyBase = if (fnv1aMod2(proxySeed) == 0) PROXY_A else PROXY_B
+            val proxyBase = proxyUrls[if (proxyUrls.size == 1) 0 else fnv1aMod2(proxySeed)]
             val obfUrl = xorEncode(streamUrl, proxyKey)
             val obfReferer = xorEncode(referer, proxyKey)
             return "${proxyBase}$obfUrl~$obfReferer/pl.m3u8"
         }
+    }
+
+    private data class CachedProxyConfig(
+        val mirror: String,
+        val fetchedAt: Long,
+        val config: MiruroProxyConfig,
+    )
+
+    private var cachedProxyConfig: CachedProxyConfig? = null
+
+    @Synchronized
+    private fun getProxyConfig(): MiruroProxyConfig {
+        val mirror = mirrorBaseUrl().trimEnd('/')
+        val now = System.currentTimeMillis()
+        cachedProxyConfig?.takeIf { it.mirror == mirror && now - it.fetchedAt < TimeUnit.HOURS.toMillis(1) }
+            ?.let { return it.config }
+
+        val config = client.newCall(GET("$mirror/env2.js", headers)).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("Unable to load Miruro proxy settings (HTTP ${response.code})")
+            MiruroProxyConfig.parse(response.body.string())
+        }
+        cachedProxyConfig = CachedProxyConfig(mirror, now, config)
+        return config
     }
 
     private val embedExtractor by lazy { OmniEmbedExtractor(client, headers) }
@@ -276,6 +291,11 @@ class MiruroExtractor(
         // FNV hash seed for proxy server selection: `${episodeId}|${anilistId}`,
         // matching the frontend's `Xb(episodeId, anilistId)` logic.
         val proxySeed = "$episodeId|$anilistId"
+        val proxyConfig by lazy {
+            runCatching { getProxyConfig() }
+                .onFailure { Log.w(TAG, "Unable to load Miruro proxy settings; skipping HLS streams", it) }
+                .getOrNull()
+        }
 
         for (stream in sourcesDto.streams) {
             if (stream.url.isEmpty()) continue
@@ -299,19 +319,22 @@ class MiruroExtractor(
 
             when (stream.type.lowercase()) {
                 "hls" -> {
+                    val config = proxyConfig ?: continue
                     val proxyReferer = stream.referer.trim().ifEmpty { KWIK_DEFAULT_REFERER }
                     val proxiedUrl = buildProxiedUrl(
                         streamUrl = stream.url,
                         referer = proxyReferer,
-                        proxyKey = proxyKey,
+                        proxyKey = config.key,
                         proxySeed = proxySeed,
+                        proxyUrls = config.urls,
                     )
                     if (proxiedUrl != stream.url) {
                         Log.d(TAG, "HLS proxy-wrapped: ${stream.url.take(60)} → ${proxiedUrl.take(60)}")
                     }
+                    val mirror = mirrorBaseUrl().trimEnd('/')
                     val proxyHeaders = headers.newBuilder()
-                        .set("Referer", "${mirrorBaseUrl.trimEnd('/')}/")
-                        .set("Origin", mirrorBaseUrl.trimEnd('/'))
+                        .set("Referer", "$mirror/")
+                        .set("Origin", mirror)
                         .build()
                     videos.add(
                         Video(proxiedUrl, qualityLabel, proxiedUrl, proxyHeaders, subtitleTracks = subtitles),
