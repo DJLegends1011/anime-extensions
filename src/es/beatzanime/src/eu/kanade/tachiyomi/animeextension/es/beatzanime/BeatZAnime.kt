@@ -1,22 +1,19 @@
 package eu.kanade.tachiyomi.animeextension.es.beatzanime
 
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
+import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
-import eu.kanade.tachiyomi.util.asJsoup
-import keiyoushi.utils.parseAs
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.JsonObject
-import okhttp3.FormBody
-import okhttp3.HttpUrl.Companion.toHttpUrl
+import keiyoushi.utils.useAsJsoup
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.net.URLDecoder
+import java.text.Normalizer
 
 class BeatZAnime : ParsedAnimeHttpSource() {
 
@@ -24,90 +21,126 @@ class BeatZAnime : ParsedAnimeHttpSource() {
 
     override val baseUrl = "https://www.beatz-anime.net"
 
-    private val indexHost = "dd.beatz-anime.net"
-    private val indexHttpUrl = "https://$indexHost".toHttpUrl()
-
     override val lang = "es"
 
     override val supportsLatest = true
 
     // ============================== Popular ===============================
+    // "Top 7 most viewed" marquee on the home page.
+    // The marquee duplicates every card for CSS infinite-scroll animation,
+    // so popularAnimeParse() deduplicates by href.
 
-    override fun popularAnimeRequest(page: Int): Request {
-        val url = if (page > 1) {
-            "$baseUrl/emision/pagina=$page"
-        } else {
-            "$baseUrl/emision/"
-        }
+    override fun popularAnimeRequest(page: Int): Request = GET(baseUrl, headers)
 
-        return GET(url, headers)
-    }
-
-    override fun popularAnimeSelector(): String = ".row > div:has(a.titulo-largo)"
+    override fun popularAnimeSelector(): String = "article.top-views-card"
 
     override fun popularAnimeFromElement(element: Element): SAnime = SAnime.create().apply {
-        thumbnail_url = element.selectFirst("img")!!.imgAttr()
-        with(element.selectFirst("a.titulo-largo")!!) {
-            setUrlWithoutDomain(attr("abs:href"))
-            title = text()
-        }
+        val anchor = element.selectFirst("a.top-views-poster")!!
+        setUrlWithoutDomain(anchor.attr("href"))
+        thumbnail_url = anchor.selectFirst("img")?.attr("abs:src")
+        title = element.selectFirst("h3.top-views-title")!!.text()
     }
 
-    override fun popularAnimeNextPageSelector(): String = "ul.pagination > li.active + li:not(.disabled)"
+    override fun popularAnimeParse(response: Response): AnimesPage {
+        val animes = response.useAsJsoup()
+            .select(popularAnimeSelector())
+            .map { popularAnimeFromElement(it) }
+            .distinctBy { it.url }
+        return AnimesPage(animes, hasNextPage = false)
+    }
+
+    override fun popularAnimeNextPageSelector() = throw UnsupportedOperationException()
 
     // =============================== Latest ===============================
 
     override fun latestUpdatesRequest(page: Int): Request {
-        val url = if (page > 1) {
-            "$baseUrl/index.php?pagina=$page"
-        } else {
-            "$baseUrl/"
-        }
-
+        val url = if (page > 1) "$baseUrl/index.php?pagina=$page" else "$baseUrl/"
         return GET(url, headers)
     }
-    override fun latestUpdatesSelector(): String = popularAnimeSelector()
 
-    override fun latestUpdatesFromElement(element: Element): SAnime = popularAnimeFromElement(element)
+    override fun latestUpdatesSelector(): String = ".row > div:has(a.titulo-largo)"
 
-    override fun latestUpdatesNextPageSelector(): String = popularAnimeNextPageSelector()
+    override fun latestUpdatesFromElement(element: Element): SAnime = SAnime.create().apply {
+        with(element.selectFirst("a.titulo-largo")!!) {
+            setUrlWithoutDomain(attr("abs:href"))
+            title = text()
+            thumbnail_url = posterUrl(attr("href"))
+        }
+    }
+
+    override fun latestUpdatesNextPageSelector(): String = "ul.pagination > li.active + li:not(.disabled)"
 
     // =============================== Search ===============================
 
+    // The /lista-animes/ page returns all cards in one response. Filtering is
+    // applied entirely client-side by JS via data-* attributes on each card.
+    // The server ignores any query parameters. We mirror the same logic here.
+    //
+    // To avoid relying on mutable instance fields (which would break under
+    // concurrent source calls), the filter state is encoded into the Request
+    // tag as a SearchParams data class and recovered inside searchAnimeParse().
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val source = filters.filterIsInstance<SourceFilter>().first().getValue()
-        val status = filters.filterIsInstance<StatusFilter>().first().getValue()
-        val type = filters.filterIsInstance<TypeFilter>().first().getValue()
-
-        val url = "$baseUrl/lista-animes/index.php"
-
-        val formBody = FormBody.Builder().apply {
-            add("buscar", query)
-            add("fuente", source)
-            add("estado", status)
-            add("tipo-anime", type)
-        }.build()
-
-        val formHeaders = headersBuilder().apply {
-            add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-            add("Host", baseUrl.toHttpUrl().host)
-            add("Origin", baseUrl)
-            add("Referer", url)
-        }.build()
-
-        return POST(url, formHeaders, formBody)
+        val params = SearchParams(
+            query = query,
+            fuente = filters.filterIsInstance<SourceFilter>().firstOrNull()?.getValue() ?: "",
+            estado = filters.filterIsInstance<StatusFilter>().firstOrNull()?.getValue() ?: "",
+            tipo = filters.filterIsInstance<TypeFilter>().firstOrNull()?.getValue() ?: "",
+        )
+        return GET("$baseUrl/lista-animes/", headers).newBuilder()
+            .tag(SearchParams::class.java, params)
+            .build()
     }
 
-    override fun searchAnimeSelector(): String = ".row > div:has(span.titulo)"
+    override fun searchAnimeSelector(): String = "div.anime-card"
 
     override fun searchAnimeFromElement(element: Element): SAnime = SAnime.create().apply {
-        thumbnail_url = element.selectFirst("img")!!.imgAttr()
-        with(element.selectFirst("a:has(span)")!!) {
-            setUrlWithoutDomain(attr("abs:href"))
-            title = text()
-        }
+        val anchor = element.selectFirst("a.anime-poster-link")!!
+        setUrlWithoutDomain(anchor.attr("href"))
+        thumbnail_url = anchor.selectFirst("img.anime-poster")?.attr("abs:src")
+        title = element.selectFirst("span.overlay-title-link")?.text()
+            ?: anchor.attr("title")
     }
 
+    /**
+     * Client-side filtering that mirrors the JS on /lista-animes/.
+     *
+     * Each div.anime-card carries:
+     *   data-name   — lowercase, accent-stripped title
+     *   data-fuente — "bdrip" or "webrip"
+     *   data-estado — "finalizado" or "en emisión"
+     *   data-tipo   — "serie" or "pelicula"
+     *
+     * Both the filter values and the data attributes are accent-normalised
+     * before comparison so that e.g. "En Emision" matches "en emisión".
+     * Filter state travels from searchAnimeRequest via the Request tag to
+     * avoid any concurrency issues with mutable instance fields.
+     */
+    override fun searchAnimeParse(response: Response): AnimesPage {
+        val params = response.request.tag(SearchParams::class.java) ?: SearchParams()
+        val document = response.useAsJsoup()
+        val query = params.query.normalizeAccents()
+        val fuente = params.fuente.normalizeAccents()
+        val estado = params.estado.normalizeAccents()
+        val tipo = params.tipo.normalizeAccents()
+
+        val animes = document.select(searchAnimeSelector()).mapNotNull { el ->
+            val matchName = query.isEmpty() ||
+                el.attr("data-name").normalizeAccents().contains(query)
+            val matchFuente = fuente.isEmpty() ||
+                el.attr("data-fuente").normalizeAccents() == fuente
+            val matchEstado = estado.isEmpty() ||
+                el.attr("data-estado").normalizeAccents() == estado
+            val matchTipo = tipo.isEmpty() ||
+                el.attr("data-tipo").normalizeAccents() == tipo
+
+            if (matchName && matchFuente && matchEstado && matchTipo) {
+                searchAnimeFromElement(el)
+            } else {
+                null
+            }
+        }
+        return AnimesPage(animes, hasNextPage = false)
+    }
     override fun searchAnimeNextPageSelector(): String? = null
 
     // ============================== Filters ===============================
@@ -122,17 +155,17 @@ class BeatZAnime : ParsedAnimeHttpSource() {
 
     override fun animeDetailsParse(document: Document): SAnime = SAnime.create().apply {
         title = document.selectFirst("h1")!!.text()
-        thumbnail_url = document.selectFirst(".row > div > img")?.imgAttr()
+        thumbnail_url = document.selectFirst("div.poster-card img")?.attr("abs:src")
         genre = document.selectFirst("p.post-text span:has(b:contains(Generos))")?.ownText()
         status = document.selectFirst("div:has(>h5:contains(Estado)) a").parseStatus()
         description = buildString {
-            document.selectFirst("p.post-text")?.textNodes()?.let {
-                append(it.joinToString("\n\n") { it.text() })
+            document.selectFirst("p.post-text")?.textNodes()?.let { node ->
+                append(node.joinToString("\n\n") { it.text() })
             }
             append("\n\n")
-            document.selectFirst("p.post-text span:has(b:contains(Sinónimos))")?.let {
+            document.selectFirst("p.post-text span:has(b:contains(Sinónimos))")?.let { span: Element ->
                 append("Sinónimos: ")
-                append(it.ownText())
+                append(span.ownText())
             }
         }.trim()
     }
@@ -146,135 +179,194 @@ class BeatZAnime : ParsedAnimeHttpSource() {
     // ============================== Episodes ==============================
 
     override fun episodeListSelector(): String = throw UnsupportedOperationException()
-
     override fun episodeFromElement(element: Element): SEpisode = throw UnsupportedOperationException()
 
+    /**
+     * Parses the file table embedded in the anime page (#collapseExampled tbody tr).
+     *
+     * Each row has six cells:
+     *   [0] display name | [1] format | [2] type label | [3] size
+     *   [4] download anchor (a.btn-descarga-premium) | [5] copy button
+     *
+     * Only rows whose type cell reads "Video", or whose format is a known
+     * playable extension (mkv / mp4), are included. Non-playable files such
+     * as checksum archives are skipped — ExoPlayer cannot open them.
+     *
+     * The full absolute download URL is stored in episode.url so that
+     * getVideoList() can return a Video object without an extra HTTP call.
+     */
     override fun episodeListParse(response: Response): List<SEpisode> {
-        val document = response.asJsoup()
-        val episodeList = mutableListOf<SEpisode>()
+        val document = response.useAsJsoup()
+        val rows = document.select("#collapseExampled tbody tr")
+        if (rows.isEmpty()) return emptyList()
 
-        val indexUrlRaw = document.selectFirst("a[href*=$indexHost]")!!.attr("abs:href").toHttpUrl()
-        val indexUrl = if (indexUrlRaw.encodedPath.contains("api/raw/")) {
-            val path = indexUrlRaw.queryParameter("path")!!.substringAfter("/")
-                .substringBefore("/")
-            "https://$indexHost/$path/"
-        } else {
-            indexUrlRaw.toString()
-        }
+        val episodes = mutableListOf<SEpisode>()
 
-        fun traverseFolder(basePath: String, relativePath: String, recursionDepth: Int = 0) {
-            if (recursionDepth == 2) return
+        rows.forEachIndexed { index, row ->
+            val cells = row.select("td")
+            if (cells.size < 5) return@forEachIndexed
 
-            val apiHeaders = headersBuilder().apply {
-                add("Accept", "application/json, text/plain, */*")
-                add("Host", indexHost)
-                add(
-                    "Referer",
-                    indexHttpUrl.newBuilder()
-                        .addPathSegments(basePath)
-                        .build()
-                        .toString(),
-                )
-            }.build()
+            val format = cells[1].text().lowercase()
+            val typeLabel = cells[2].text().lowercase()
 
-            val apiUrl = indexHttpUrl.newBuilder().apply {
-                addPathSegment("api")
-                addPathSegment("")
-                addQueryParameter("path", basePath)
-            }.build()
+            val isPlayable = typeLabel == "video" || PLAYABLE_FORMATS.any { format == it }
+            if (!isPlayable) return@forEachIndexed
 
-            val data = client.newCall(
-                GET(apiUrl, apiHeaders),
-            ).execute().parseAs<IndexResponseDto>()
+            val fileUrl = cells[4].selectFirst("a.btn-descarga-premium")
+                ?.attr("abs:href")
+                ?.takeIf { it.isNotBlank() }
+                ?: return@forEachIndexed
 
-            data.folder.value.forEach { item ->
-                if (item.folder != null) {
-                    traverseFolder("$basePath/${item.name}", item.name, recursionDepth + 1)
-                } else if (item.file != null) {
-                    val fileExt = item.name.substringAfterLast(".")
-                    if (!SUPPORTED_FORMATS.any { it.equals(fileExt, true) }) return@forEach
+            // text() is more robust than ownText() for cells whose content is
+            // a plain whitespace-padded text node with no child elements.
+            val rawName = cells[0].text()
+                .takeIf { it.isNotBlank() }
+                ?: URLDecoder.decode(
+                    fileUrl.substringAfterLast("/").substringBeforeLast("."),
+                    "UTF-8",
+                ).trim()
 
-                    episodeList.add(
-                        SEpisode.create().apply {
-                            name = item.name
-                            url = "$basePath/${item.name}"
-                            scanlator = buildList {
-                                if (relativePath != "") add(relativePath)
-                                add(item.size.formatBytes())
-                            }.joinToString(" • ")
-                        },
-                    )
-                }
-            }
-        }
+            // Try SxxExx first (e.g. "S01E22"), then bare Exx (e.g. "E01"),
+            // then a trailing integer (e.g. "Episode 5"), then fall back to
+            // the row index so every entry always has a valid episode number.
+            val epNumber = EPISODE_SXX_EXX_REGEX.find(rawName)?.groupValues?.get(1)?.toFloatOrNull()
+                ?: EPISODE_EXX_REGEX.find(rawName)?.groupValues?.get(1)?.toFloatOrNull()
+                ?: EPISODE_TRAILING_INT_REGEX.find(rawName)?.groupValues?.get(1)?.toFloatOrNull()
+                ?: (index + 1).toFloat()
 
-        traverseFolder("/${indexUrl.toHttpUrl().pathSegments.first()}", "")
-
-        return episodeList.reversed()
-    }
-
-    @Serializable
-    class IndexResponseDto(
-        val folder: FolderDto,
-    ) {
-        @Serializable
-        class FolderDto(
-            val value: List<ItemDto>,
-        ) {
-            @Serializable
-            class ItemDto(
-                val name: String,
-                val size: Long,
-                val folder: JsonObject? = null,
-                val file: JsonObject? = null,
+            episodes.add(
+                SEpisode.create().apply {
+                    name = rawName
+                    url = fileUrl
+                    episode_number = epNumber
+                    scanlator = cells[3].text()
+                },
             )
         }
-    }
 
-    private fun Long.formatBytes(): String = when {
-        this >= 1_000_000_000 -> "%.2f GB".format(this / 1_000_000_000.0)
-        this >= 1_000_000 -> "%.2f MB".format(this / 1_000_000.0)
-        this >= 1_000 -> "%.2f KB".format(this / 1_000.0)
-        this > 1 -> "$this bytes"
-        this == 1L -> "$this byte"
-        else -> ""
+        // Movie pages label their single file after the release name, which
+        // often differs from the displayed title ("Gotoubun..." vs "5-toubun...",
+        // year suffixes); show the movie title instead.
+        if (isMovie(document) && episodes.size == 1) {
+            val movie = episodes[0]
+            document.selectFirst("h1")?.text()?.let { movie.name = it }
+            movie.episode_number = 1F
+        }
+
+        // The site scatters rows (e.g. Slime S1 lists eps 03-24, its Especial +
+        // OVAs in the middle, then appends eps 01-02 at the end), while its
+        // intended layout is the season's regular episodes followed by extras.
+        // Mirror that intent with a stable partition: regular episodes ordered
+        // by number, then name-detected specials (OVA/Especial/NCOP/NCED…)
+        // ordered by number, so the reversed list shows the latest regular
+        // episode first and keeps every special grouped after ALL of the
+        // season's episodes instead of interleaved with its number-twins.
+        // Specials get a sentinel number (-1) so they never collide with real
+        // episode numbering in the app's tracking/sorting.
+        val regularEpisodes = episodes
+            .filter { !SPECIAL_REGEX.containsMatchIn(it.name) }
+            .sortedBy { it.episode_number }
+        val specialEpisodes = episodes
+            .filter { SPECIAL_REGEX.containsMatchIn(it.name) }
+            .sortedBy { it.episode_number }
+            .onEach { it.episode_number = -1F }
+
+        return (specialEpisodes + regularEpisodes).reversed()
     }
 
     // ============================ Video Links =============================
 
+    /**
+     * episode.url is the full absolute direct-download URL stored during
+     * episodeListParse(). No extra HTTP call is required — wrap it in a Video.
+     *
+     * The Host header is intentionally omitted: OkHttp derives it from the URL
+     * automatically, and setting it manually can cause it to appear twice,
+     * breaking the request on some CDN configurations.
+     */
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
-        val url = indexHttpUrl.newBuilder().apply {
-            addPathSegment("api")
-            addPathSegment("raw")
-            addPathSegment("")
-            addQueryParameter("path", episode.url)
-        }.build().toString()
-
-        val path = episode.url.substringAfter("/").substringBeforeLast("/") + "/"
+        val fileUrl = episode.url
+        val qualityLabel = RESOLUTION_REGEX.find(episode.name)?.value
+            ?: fileUrl.substringAfterLast(".").uppercase()
 
         val videoHeaders = headersBuilder().apply {
-            add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-            add("Referer", indexHttpUrl.newBuilder().addPathSegments(path).build().toString())
+            add("Accept", "video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5")
+            add("Referer", "$baseUrl/")
         }.build()
 
-        return listOf(Video(url, "Video", url, videoHeaders))
+        return listOf(Video(fileUrl, qualityLabel, fileUrl, videoHeaders))
     }
 
     override fun videoListSelector() = throw UnsupportedOperationException()
-
     override fun videoFromElement(element: Element) = throw UnsupportedOperationException()
-
     override fun videoUrlParse(document: Document) = throw UnsupportedOperationException()
 
     // ============================= Utilities ==============================
 
-    private fun Element.imgAttr(): String = when {
-        hasAttr("data-lazy-src") -> attr("abs:data-lazy-src")
-        hasAttr("data-src") -> attr("abs:data-src")
-        else -> attr("abs:src")
+    /**
+     * The "Tipo" stat on details pages marks the entry as a movie ("Pelicula").
+     */
+    private fun isMovie(document: Document): Boolean = document.selectFirst("div.stat-item:has(h5:contains(Tipo)) a")
+        ?.text()
+        ?.equals("Pelicula", ignoreCase = true)
+        ?: false
+
+    /**
+     * Card images are 16:9 episode stills; the poster art follows the site's
+     * slug convention at /img/img-anime/<slug>/<slug>-port.jpg.
+     */
+    private fun posterUrl(animeUrl: String): String {
+        val slug = animeUrl.substringAfterLast('/').removeSuffix(".html")
+        return "$baseUrl/img/img-anime/$slug/$slug-port.jpg"
     }
 
+    /**
+     * Lowercases and strips combining diacritical marks so that filter values
+     * like "En Emision" match HTML data attributes like "en emisión".
+     * Mirrors the normalize() helper used by the page's own client-side JS.
+     */
+    private fun String.normalizeAccents(): String {
+        val nfd = Normalizer.normalize(this.lowercase().trim(), Normalizer.Form.NFD)
+        return nfd.replace(ACCENTS_REGEX, "")
+    }
+
+    // ========================= Data classes / companion ===================
+
+    /** Carries search filter state through the Request tag to avoid mutable instance fields. */
+    private data class SearchParams(
+        val query: String = "",
+        val fuente: String = "",
+        val estado: String = "",
+        val tipo: String = "",
+    )
+
     companion object {
-        private val SUPPORTED_FORMATS = listOf("mp4", "mkv")
+        private val PLAYABLE_FORMATS = setOf("mp4", "mkv")
+
+        // Episode number extraction — tried in order of specificity.
+
+        /** Matches SxxExx patterns, e.g. "S01E22" → captures "22". */
+        private val EPISODE_SXX_EXX_REGEX = Regex("""[Ss]\d+[Ee](\d+)""")
+
+        /** Matches bare Exx patterns, e.g. "E01" → captures "1". */
+        private val EPISODE_EXX_REGEX = Regex("""(?<![Ss]\d{1,4})[Ee](\d+)""")
+
+        /** Matches a trailing integer in the name, e.g. "Episode 5" → captures "5". */
+        private val EPISODE_TRAILING_INT_REGEX = Regex("""(\d+)\s*$""")
+
+        private val RESOLUTION_REGEX = Regex("""\d{3,4}p""", RegexOption.IGNORE_CASE)
+
+        /**
+         * Detects extras by name (vocabulary observed on the site: "OVA",
+         * "(OVA)", "Especial(es)", "Película/Pelicula", "NCOP/NCOPV", "NCED"),
+         * so they can be grouped after the regular episodes.
+         */
+        private val SPECIAL_REGEX = Regex(
+            """\b(?:oad|ova|especiales|especial|peliculas?|películas?|ncopv|ncop|nced)\b""",
+            RegexOption.IGNORE_CASE,
+        )
+
+        /** Pre-compiled for reuse in normalizeAccents(); avoids per-call Regex construction. */
+        private val ACCENTS_REGEX = Regex("\\p{InCombiningDiacriticalMarks}+")
     }
 }
